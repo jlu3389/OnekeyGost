@@ -1,24 +1,43 @@
 # GOST 一键部署脚本 (OnekeyGost)
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![GOST Version](https://img.shields.io/badge/GOST-v2.12.0-green.svg)](https://github.com/ginuerzh/gost)
+[![GOST v2](https://img.shields.io/badge/GOST%20v2-2.12.0-green.svg)](https://github.com/ginuerzh/gost)
+[![GOST v3](https://img.shields.io/badge/GOST%20v3-3.2.6-blue.svg)](https://github.com/go-gost/gost)
 
-一个功能完善的 GOST 代理/隧道一键部署管理脚本。
+一个功能完善的 GOST 代理/隧道一键部署管理脚本。**同时支持 GOST v2 和 v3**，启动时可自由切换。
 
 ## 功能特性
 
+- ✅ **双版本支持**：启动时选择 GOST v2 或 v3，各自独立的菜单与配置生成逻辑
 - ✅ **一键安装/卸载/更新** GOST
 - ✅ **自动检测**系统和 CPU 架构
 - ✅ 支持**国内镜像加速**下载
 - ✅ **systemd 服务**管理
 - ✅ 多种转发配置支持：
   - TCP/UDP 端口转发
-  - 加密隧道 (TLS/WS/WSS)
+  - 加密隧道 (TLS/WS/WSS + **gRPC/QUIC** [v3])
   - HTTP/SOCKS5 代理
   - Shadowsocks 代理
   - 负载均衡
+  - **SNI 代理** [v3]
+  - **反向代理隧道**（内网穿透）[v3]
 - ✅ **TLS 证书管理** (ACME 自动申请)
 - ✅ **定时重启**任务配置
+
+## GOST v2 与 v3 对比
+
+| 维度 | GOST v2 | GOST v3 |
+|------|---------|---------|
+| 仓库 | `ginuerzh/gost` | `go-gost/gost` |
+| 配置格式 | JSON（ServeNodes/Routes） | **YAML**（services/chains，模块化） |
+| 协议 | TCP/UDP/TLS/WS/WSS/HTTP/SOCKS5/SS | **v2 全部 + gRPC/QUIC/HTTP2/HTTP3/KCP/SSH/SNI** |
+| 反向代理 | 不支持 | ✅ 原生 rtcp/rudp |
+| TUN/TAP | 不支持 | ✅ 支持 |
+| Web API | 不支持 | ✅ 支持动态配置与热加载 |
+| 监控指标 | 无 | ✅ Prometheus metrics |
+| 维护状态 | 基本停滞 | 活跃维护 |
+
+**建议**：新部署优先选择 **v3**；有既有 v2 配置迁移成本考虑时可继续使用 v2。
 
 ## 快速开始
 
@@ -43,17 +62,38 @@ bash <(curl -fsSL https://raw.githubusercontent.com/jlu3389/OnekeyGost/main/gost
 
 ## 使用方法
 
-运行脚本后会显示交互式菜单：
+### 启动流程
 
 ```
-╔══════════════════════════════════════════════════════════╗
-║                                                          ║
-║          GOST 一键部署管理脚本 v1.0.0                    ║
-║          OneKey GOST Deployment Script                   ║
-║                                                          ║
-╚══════════════════════════════════════════════════════════╝
+脚本启动 → 选择 v2 或 v3 菜单模式 → 进入对应版本的管理菜单
+```
 
-  当前版本: v2.12.0
+首次启动会出现版本选择器：
+
+```
+  请选择 GOST 版本
+────────────────────────────────────────────────────────
+
+  [1] GOST v2  (ginuerzh/gost)
+      • 协议: TCP/UDP/TLS/WS/WSS/HTTP/SOCKS5/SS
+      • 配置: JSON (ServeNodes/Routes/ChainNodes)
+      • 状态: 原作者已基本停止维护
+
+  [2] GOST v3  (go-gost/gost) [推荐]
+      • 协议: v2 全部 + gRPC/QUIC/HTTP2/HTTP3/KCP/SSH/SNI
+               + 反向代理隧道/TUN/TAP/透明代理
+      • 配置: YAML (services/chains，结构化、模块化)
+      • 特点: 支持 Web API 动态配置、热加载、限速、监控指标
+      • 状态: 活跃维护
+
+  提示: v2 与 v3 配置文件格式不兼容，二进制与配置同路径互斥。
+```
+
+### 主菜单
+
+```
+  当前模式: GOST v3
+  已安装版本: v3.2.6 (主版本 v3)
   运行状态: 运行中
 ────────────────────────────────────────────────────────
 
@@ -74,6 +114,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/jlu3389/OnekeyGost/main/gost
   高级功能
     [12] TLS 证书管理
     [13] 定时重启设置
+    [14] 切换 v2/v3 菜单模式
 
     [0]  退出
 ```
@@ -159,9 +200,13 @@ bash <(curl -fsSL https://raw.githubusercontent.com/jlu3389/OnekeyGost/main/gost
 |------|------|
 | GOST 程序 | `/usr/local/bin/gost` |
 | 配置目录 | `/etc/gost/` |
-| 配置文件 | `/etc/gost/config.json` |
+| 配置文件 (v2) | `/etc/gost/config.json` |
+| 配置文件 (v3) | `/etc/gost/gost.yml` |
+| 版本标记 | `/etc/gost/.major_version` |
 | 服务文件 | `/etc/systemd/system/gost.service` |
 | 证书目录 | `~/gost_cert/` |
+
+> v2 和 v3 的二进制与配置采用**同路径互斥**：同一时间只能运行一个版本。脚本会将主版本号写入 `.major_version` 文件以供识别，切换版本请通过菜单 `[14]` 或重新运行脚本。
 
 ## 常用命令
 
@@ -297,9 +342,10 @@ sudo ./gost.sh
 
 ## 参考文档
 
-- [GOST 官方文档 (v2)](https://v2.gost.run)
-- [GOST GitHub 仓库](https://github.com/ginuerzh/gost)
-- [GOST v3 文档](https://gost.run)
+- [GOST v3 官方文档](https://gost.run) （推荐）
+- [GOST v3 GitHub 仓库](https://github.com/go-gost/gost)
+- [GOST v2 官方文档](https://v2.gost.run)
+- [GOST v2 GitHub 仓库](https://github.com/ginuerzh/gost)
 
 ## 致谢
 
@@ -311,6 +357,20 @@ sudo ./gost.sh
 MIT License
 
 ## 更新日志
+
+### v2.0.0
+
+- **新增 GOST v3 支持**（go-gost/gost）
+  - 启动时选择 v2 / v3 菜单模式
+  - v3 使用 YAML 配置文件（gost.yml）
+  - 自动适配不同仓库的 release 包命名与下载
+- v3 独有协议：
+  - gRPC 加密隧道
+  - QUIC 加密隧道（基于 UDP）
+  - SNI 代理（基于 TLS SNI 的透明转发）
+  - 反向代理隧道（rtcp，内网穿透）
+- v2 逻辑完全向后兼容
+- 主菜单新增 `[14] 切换 v2/v3 菜单模式`
 
 ### v1.0.0 (2024-01-21)
 

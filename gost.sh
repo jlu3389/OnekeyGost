@@ -9,16 +9,30 @@
 #
 
 # ==================== 全局变量 ====================
-SCRIPT_VERSION="1.0.0"
-GOST_VERSION="2.12.0"
+SCRIPT_VERSION="2.0.0"
+
+# v2 默认版本与仓库
+GOST_V2_DEFAULT_VERSION="2.12.0"
+GOST_V2_REPO="ginuerzh/gost"
+
+# v3 默认版本与仓库
+GOST_V3_DEFAULT_VERSION="3.2.6"
+GOST_V3_REPO="go-gost/gost"
+
+# 通用路径（v2/v3 同路径互斥）
 GOST_INSTALL_PATH="/usr/local/bin/gost"
 GOST_CONFIG_DIR="/etc/gost"
-GOST_CONFIG_FILE="${GOST_CONFIG_DIR}/config.json"
 GOST_RAW_CONFIG="${GOST_CONFIG_DIR}/rawconf"
+GOST_VERSION_MARK="${GOST_CONFIG_DIR}/.major_version"
 GOST_SERVICE_FILE="/etc/systemd/system/gost.service"
 GOST_CERT_DIR="${HOME}/gost_cert"
-GOST_GITHUB_REPO="ginuerzh/gost"
-GOST_DOWNLOAD_URL="https://github.com/${GOST_GITHUB_REPO}/releases/download"
+
+# 动态字段（根据 GOST_MAJOR 在 load_version_context 里赋值）
+GOST_MAJOR=""          # 2 或 3
+GOST_CONFIG_FILE=""    # v2: config.json   v3: gost.yml
+GOST_GITHUB_REPO=""
+GOST_DOWNLOAD_URL=""
+GOST_DEFAULT_VERSION=""
 
 # 颜色定义
 RED='\033[0;31m'
@@ -80,6 +94,69 @@ confirm() {
     answer=${answer:-$default}
     
     [[ "$answer" =~ ^[Yy]$ ]]
+}
+
+# ==================== 版本上下文 ====================
+
+# 根据 GOST_MAJOR(2/3) 设置对应的仓库、配置文件名、下载地址等
+load_version_context() {
+    case "$GOST_MAJOR" in
+        2)
+            GOST_GITHUB_REPO="$GOST_V2_REPO"
+            GOST_DEFAULT_VERSION="$GOST_V2_DEFAULT_VERSION"
+            GOST_CONFIG_FILE="${GOST_CONFIG_DIR}/config.json"
+            ;;
+        3)
+            GOST_GITHUB_REPO="$GOST_V3_REPO"
+            GOST_DEFAULT_VERSION="$GOST_V3_DEFAULT_VERSION"
+            GOST_CONFIG_FILE="${GOST_CONFIG_DIR}/gost.yml"
+            ;;
+        *)
+            # 尚未确定版本，暂不设置
+            GOST_GITHUB_REPO=""
+            GOST_DEFAULT_VERSION=""
+            GOST_CONFIG_FILE=""
+            return 1
+            ;;
+    esac
+    GOST_DOWNLOAD_URL="https://github.com/${GOST_GITHUB_REPO}/releases/download"
+    return 0
+}
+
+# 检测已安装的 GOST 主版本号（2 或 3），写入到 GOST_VERSION_MARK
+detect_installed_major() {
+    if [[ ! -f "$GOST_INSTALL_PATH" ]]; then
+        echo ""
+        return
+    fi
+
+    # 优先读取版本标记文件
+    if [[ -f "$GOST_VERSION_MARK" ]]; then
+        local m
+        m=$(cat "$GOST_VERSION_MARK" 2>/dev/null)
+        if [[ "$m" == "2" || "$m" == "3" ]]; then
+            echo "$m"
+            return
+        fi
+    fi
+
+    # 从二进制版本输出推断
+    local ver_output
+    ver_output=$($GOST_INSTALL_PATH -V 2>&1 | head -n 1)
+    # v2: "gost v2.12.0"  v3: "gost version 3.x.x" 或 "gost 3.x.x"
+    if echo "$ver_output" | grep -qE "v?3\."; then
+        echo "3"
+    elif echo "$ver_output" | grep -qE "v?2\."; then
+        echo "2"
+    else
+        echo ""
+    fi
+}
+
+# 持久化主版本号
+mark_major_version() {
+    mkdir -p "$GOST_CONFIG_DIR"
+    echo "$1" > "$GOST_VERSION_MARK"
 }
 
 # ==================== 系统检测 ====================
@@ -177,45 +254,55 @@ download_gost() {
     local version="$1"
     local use_mirror="$2"
     local download_url
-    local filename="gost_${version}_linux_${ARCH}.tar.gz"
-    
-    if [[ "$use_mirror" == "y" ]]; then
-        # 国内镜像
-        download_url="https://ghproxy.com/https://github.com/${GOST_GITHUB_REPO}/releases/download/v${version}/${filename}"
+    local filename
+
+    # v3 与 v2 的 release 包命名约定不同
+    # v2: gost_2.12.0_linux_amd64.tar.gz  内含 gost 可执行文件
+    # v3: gost_3.2.6_linux_amd64v3.tar.gz 或 gost_3.2.6_linux_amd64.tar.gz (amd64 有 v2/v3 两种)
+    if [[ "$GOST_MAJOR" == "3" ]]; then
+        filename="gost_${version}_linux_${ARCH}.tar.gz"
     else
-        download_url="${GOST_DOWNLOAD_URL}/v${version}/${filename}"
+        filename="gost_${version}_linux_${ARCH}.tar.gz"
+    fi
+
+    local base_url="${GOST_DOWNLOAD_URL}/v${version}/${filename}"
+    if [[ "$use_mirror" == "y" ]]; then
+        download_url="https://ghproxy.com/${base_url}"
+    else
+        download_url="$base_url"
     fi
     
     print_info "下载地址: ${download_url}"
     print_info "正在下载 GOST v${version}..."
     
-    cd /tmp
+    cd /tmp || return 1
     rm -f gost_*.tar.gz gost gost-linux-* 2>/dev/null
     
     if wget -q --show-progress -O "$filename" "$download_url" 2>/dev/null; then
-        tar -xzf "$filename"
+        tar -xzf "$filename" 2>/dev/null
         if [[ -f "gost" ]]; then
             chmod +x gost
             print_success "下载完成"
             return 0
         fi
     fi
-    
-    # 尝试旧版本格式 (gost-linux-amd64-x.x.x.gz)
-    print_warn "尝试旧版本格式..."
-    local old_filename="gost-linux-${ARCH}-${version}.gz"
-    if [[ "$use_mirror" == "y" ]]; then
-        download_url="https://ghproxy.com/https://github.com/${GOST_GITHUB_REPO}/releases/download/v${version}/${old_filename}"
-    else
-        download_url="${GOST_DOWNLOAD_URL}/v${version}/${old_filename}"
-    fi
-    
-    if wget -q --show-progress -O "$old_filename" "$download_url" 2>/dev/null; then
-        gunzip -f "$old_filename"
-        mv "gost-linux-${ARCH}-${version}" gost
-        chmod +x gost
-        print_success "下载完成"
-        return 0
+
+    # v2 兼容老格式 (gost-linux-amd64-x.x.x.gz)
+    if [[ "$GOST_MAJOR" == "2" ]]; then
+        print_warn "尝试旧版本格式..."
+        local old_filename="gost-linux-${ARCH}-${version}.gz"
+        local old_url="${GOST_DOWNLOAD_URL}/v${version}/${old_filename}"
+        if [[ "$use_mirror" == "y" ]]; then
+            old_url="https://ghproxy.com/${old_url}"
+        fi
+
+        if wget -q --show-progress -O "$old_filename" "$old_url" 2>/dev/null; then
+            gunzip -f "$old_filename"
+            mv "gost-linux-${ARCH}-${version}" gost
+            chmod +x gost
+            print_success "下载完成"
+            return 0
+        fi
     fi
     
     print_error "下载失败"
@@ -225,14 +312,20 @@ download_gost() {
 install_gost() {
     print_header
     print_line
-    echo -e "${BOLD}安装 GOST${NC}"
+    echo -e "${BOLD}安装 GOST (v${GOST_MAJOR})${NC}"
     print_line
     
     # 检查是否已安装
-    local installed_ver
+    local installed_ver installed_major
     installed_ver=$(get_installed_version)
+    installed_major=$(detect_installed_major)
+
     if [[ -n "$installed_ver" ]]; then
-        print_warn "检测到已安装 GOST v${installed_ver}"
+        print_warn "检测到已安装 GOST v${installed_ver} (主版本 v${installed_major:-?})"
+        if [[ -n "$installed_major" && "$installed_major" != "$GOST_MAJOR" ]]; then
+            print_warn "当前菜单为 v${GOST_MAJOR}，将覆盖已有的 v${installed_major} 安装"
+            print_warn "v2 和 v3 配置文件格式不兼容，建议先卸载旧版本或保留配置备份"
+        fi
         if ! confirm "是否覆盖安装?"; then
             return
         fi
@@ -249,9 +342,9 @@ install_gost() {
     latest_ver=$(get_latest_version)
     
     echo ""
-    echo -e "可用版本:"
+    echo -e "可用版本 (GOST v${GOST_MAJOR}):"
     echo -e "  [1] 最新版本 v${latest_ver} ${GREEN}(推荐)${NC}"
-    echo -e "  [2] 稳定版本 v2.11.5"
+    echo -e "  [2] 默认稳定版本 v${GOST_DEFAULT_VERSION}"
     echo -e "  [3] 自定义版本"
     echo ""
     read -r -p "请选择 [1-3] (默认: 1): " ver_choice
@@ -260,9 +353,9 @@ install_gost() {
     local install_ver
     case $ver_choice in
         1) install_ver="$latest_ver" ;;
-        2) install_ver="2.11.5" ;;
+        2) install_ver="$GOST_DEFAULT_VERSION" ;;
         3)
-            read -r -p "请输入版本号 (如 2.11.2): " install_ver
+            read -r -p "请输入版本号 (如 ${GOST_DEFAULT_VERSION}): " install_ver
             ;;
         *) install_ver="$latest_ver" ;;
     esac
@@ -280,7 +373,10 @@ install_gost() {
         print_error "安装失败"
         return 1
     fi
-    
+
+    # 停止可能存在的旧服务
+    systemctl stop gost 2>/dev/null || true
+
     # 安装
     print_info "安装 GOST..."
     mv /tmp/gost "$GOST_INSTALL_PATH"
@@ -288,10 +384,23 @@ install_gost() {
     
     # 创建配置目录
     mkdir -p "$GOST_CONFIG_DIR"
+
+    # 记录主版本号
+    mark_major_version "$GOST_MAJOR"
     
     # 创建默认配置文件
     if [[ ! -f "$GOST_CONFIG_FILE" ]]; then
-        cat > "$GOST_CONFIG_FILE" << 'EOF'
+        if [[ "$GOST_MAJOR" == "3" ]]; then
+            cat > "$GOST_CONFIG_FILE" << 'EOF'
+# GOST v3 configuration (YAML)
+services: []
+chains: []
+log:
+  level: info
+  format: text
+EOF
+        else
+            cat > "$GOST_CONFIG_FILE" << 'EOF'
 {
     "Debug": false,
     "Retries": 3,
@@ -300,6 +409,7 @@ install_gost() {
     "Routes": []
 }
 EOF
+        fi
     fi
     
     # 创建原始配置文件
@@ -316,6 +426,7 @@ EOF
     print_line
     print_success "GOST v${install_ver} 安装成功!"
     print_line
+    echo -e "  主版本:   v${GOST_MAJOR}"
     echo -e "  安装路径: ${GOST_INSTALL_PATH}"
     echo -e "  配置目录: ${GOST_CONFIG_DIR}"
     echo -e "  配置文件: ${GOST_CONFIG_FILE}"
@@ -326,17 +437,27 @@ EOF
 }
 
 create_service() {
+    local doc_url exec_cmd
+    if [[ "$GOST_MAJOR" == "3" ]]; then
+        doc_url="https://gost.run"
+        # v3 使用 -C 加载 yaml/json 配置文件
+        exec_cmd="${GOST_INSTALL_PATH} -C ${GOST_CONFIG_FILE}"
+    else
+        doc_url="https://v2.gost.run"
+        exec_cmd="${GOST_INSTALL_PATH} -C ${GOST_CONFIG_FILE}"
+    fi
+
     cat > "$GOST_SERVICE_FILE" << EOF
 [Unit]
-Description=GOST Proxy Service
-Documentation=https://v2.gost.run
+Description=GOST Proxy Service (v${GOST_MAJOR})
+Documentation=${doc_url}
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
-ExecStart=${GOST_INSTALL_PATH} -C ${GOST_CONFIG_FILE}
+ExecStart=${exec_cmd}
 Restart=always
 RestartSec=5
 LimitNOFILE=65535
@@ -352,7 +473,7 @@ EOF
 uninstall_gost() {
     print_header
     print_line
-    echo -e "${BOLD}卸载 GOST${NC}"
+    echo -e "${BOLD}卸载 GOST (v${GOST_MAJOR})${NC}"
     print_line
     
     if [[ ! -f "$GOST_INSTALL_PATH" ]]; then
@@ -509,7 +630,7 @@ show_logs() {
 add_config() {
     print_header
     print_line
-    echo -e "${BOLD}添加转发规则${NC}"
+    echo -e "${BOLD}添加转发规则 (GOST v${GOST_MAJOR})${NC}"
     print_line
     echo ""
     echo -e "请选择配置类型:"
@@ -518,7 +639,11 @@ add_config() {
     echo -e "      ${CYAN}说明: 将本机端口流量转发到目标地址${NC}"
     echo ""
     echo -e "  ${GREEN}[2]${NC} 加密隧道转发 (中转机)"
-    echo -e "      ${CYAN}说明: 加密流量后转发到落地机，支持 TLS/WS/WSS${NC}"
+    if [[ "$GOST_MAJOR" == "3" ]]; then
+        echo -e "      ${CYAN}说明: 加密流量后转发到落地机，支持 TLS/WS/WSS/gRPC/QUIC${NC}"
+    else
+        echo -e "      ${CYAN}说明: 加密流量后转发到落地机，支持 TLS/WS/WSS${NC}"
+    fi
     echo ""
     echo -e "  ${GREEN}[3]${NC} 解密隧道接收 (落地机)"
     echo -e "      ${CYAN}说明: 接收并解密来自中转机的流量${NC}"
@@ -531,12 +656,26 @@ add_config() {
     echo ""
     echo -e "  ${GREEN}[6]${NC} 负载均衡"
     echo -e "      ${CYAN}说明: 将流量分发到多个后端服务器${NC}"
+
+    local max_choice=6
+    if [[ "$GOST_MAJOR" == "3" ]]; then
+        echo ""
+        echo -e "  ${BOLD}━━ v3 独有协议 ━━${NC}"
+        echo ""
+        echo -e "  ${GREEN}[7]${NC} SNI 代理"
+        echo -e "      ${CYAN}说明: 基于 TLS SNI 的透明转发，无需解密${NC}"
+        echo ""
+        echo -e "  ${GREEN}[8]${NC} 反向代理隧道 (内网穿透)"
+        echo -e "      ${CYAN}说明: 将内网服务通过跳板机暴露到公网${NC}"
+        max_choice=8
+    fi
+
     echo ""
     echo -e "  ${GREEN}[0]${NC} 返回主菜单"
     echo ""
     print_line
     
-    read -r -p "请选择 [0-6]: " config_type
+    read -r -p "请选择 [0-${max_choice}]: " config_type
     
     case $config_type in
         1) add_forward_config ;;
@@ -545,6 +684,20 @@ add_config() {
         4) add_proxy_config ;;
         5) add_ss_config ;;
         6) add_loadbalance_config ;;
+        7)
+            if [[ "$GOST_MAJOR" == "3" ]]; then
+                add_sni_config
+            else
+                print_error "无效选择"
+            fi
+            ;;
+        8)
+            if [[ "$GOST_MAJOR" == "3" ]]; then
+                add_rtcp_config
+            else
+                print_error "无效选择"
+            fi
+            ;;
         0) return ;;
         *) print_error "无效选择" ;;
     esac
@@ -598,14 +751,34 @@ add_encrypt_config() {
     echo -e "  [1] TLS 隧道"
     echo -e "  [2] WebSocket (WS) 隧道"
     echo -e "  [3] WebSocket + TLS (WSS) 隧道"
+    local max_enc=3
+    if [[ "$GOST_MAJOR" == "3" ]]; then
+        echo -e "  [4] gRPC 隧道 ${GREEN}(v3)${NC}"
+        echo -e "  [5] QUIC 隧道 ${GREEN}(v3, 基于 UDP)${NC}"
+        max_enc=5
+    fi
     echo ""
-    read -r -p "请选择 [1-3]: " encrypt_type
+    read -r -p "请选择 [1-${max_enc}]: " encrypt_type
     
     local encrypt_name
     case $encrypt_type in
         1) encrypt_name="tls" ;;
         2) encrypt_name="ws" ;;
         3) encrypt_name="wss" ;;
+        4)
+            if [[ "$GOST_MAJOR" == "3" ]]; then
+                encrypt_name="grpc"
+            else
+                print_error "无效选择"; return
+            fi
+            ;;
+        5)
+            if [[ "$GOST_MAJOR" == "3" ]]; then
+                encrypt_name="quic"
+            else
+                print_error "无效选择"; return
+            fi
+            ;;
         *) print_error "无效选择"; return ;;
     esac
     
@@ -628,7 +801,7 @@ add_encrypt_config() {
     fi
     
     local secure=""
-    if [[ "$encrypt_type" == "1" ]] || [[ "$encrypt_type" == "3" ]]; then
+    if [[ "$encrypt_name" == "tls" || "$encrypt_name" == "wss" || "$encrypt_name" == "grpc" || "$encrypt_name" == "quic" ]]; then
         if confirm "落地机是否使用自定义证书? (启用证书校验)"; then
             secure="?secure=true"
         fi
@@ -656,14 +829,26 @@ add_decrypt_config() {
     echo -e "  [1] TLS 解密"
     echo -e "  [2] WebSocket (WS) 解密"
     echo -e "  [3] WebSocket + TLS (WSS) 解密"
+    local max_dec=3
+    if [[ "$GOST_MAJOR" == "3" ]]; then
+        echo -e "  [4] gRPC 解密 ${GREEN}(v3)${NC}"
+        echo -e "  [5] QUIC 解密 ${GREEN}(v3)${NC}"
+        max_dec=5
+    fi
     echo ""
-    read -r -p "请选择 [1-3]: " decrypt_type
+    read -r -p "请选择 [1-${max_dec}]: " decrypt_type
     
     local decrypt_name
     case $decrypt_type in
         1) decrypt_name="tls" ;;
         2) decrypt_name="ws" ;;
         3) decrypt_name="wss" ;;
+        4)
+            if [[ "$GOST_MAJOR" == "3" ]]; then decrypt_name="grpc"; else print_error "无效选择"; return; fi
+            ;;
+        5)
+            if [[ "$GOST_MAJOR" == "3" ]]; then decrypt_name="quic"; else print_error "无效选择"; return; fi
+            ;;
         *) print_error "无效选择"; return ;;
     esac
     
@@ -876,6 +1061,92 @@ add_loadbalance_config() {
     echo -e "  后端: ${servers}"
 }
 
+# ---------------- v3 独有配置函数 ----------------
+
+add_sni_config() {
+    echo ""
+    print_line
+    echo -e "${BOLD}SNI 代理配置 (v3)${NC}"
+    print_line
+    echo ""
+    echo -e "${CYAN}说明: SNI 代理根据 TLS 握手中的 SNI 域名转发流量，不需要解密证书。${NC}"
+    echo -e "${CYAN}      常用于 443 端口同时中转多个 HTTPS 站点。${NC}"
+    echo ""
+
+    read -r -p "请输入本地监听端口 (通常为 443): " local_port
+    if ! [[ "$local_port" =~ ^[0-9]+$ ]] || [[ "$local_port" -lt 1 ]] || [[ "$local_port" -gt 65535 ]]; then
+        print_error "无效的端口号"
+        return
+    fi
+
+    # SNI 使用 param1/param2 留空
+    echo "sni/${local_port}##" >> "$GOST_RAW_CONFIG"
+
+    generate_config
+    restart_gost
+
+    echo ""
+    print_success "SNI 代理配置已添加"
+    echo -e "  监听端口: ${local_port}  (基于 SNI 域名透明转发)"
+}
+
+add_rtcp_config() {
+    echo ""
+    print_line
+    echo -e "${BOLD}反向代理隧道配置 (v3)${NC}"
+    print_line
+    echo ""
+    echo -e "${CYAN}说明: 在内网机器上运行本配置，通过公网跳板机暴露内网服务。${NC}"
+    echo -e "${CYAN}典型场景: 家里内网 SSH 暴露到公网访问。${NC}"
+    echo ""
+
+    read -r -p "请输入跳板机上要监听的公网端口 (如 2222): " local_port
+    if ! [[ "$local_port" =~ ^[0-9]+$ ]] || [[ "$local_port" -lt 1 ]] || [[ "$local_port" -gt 65535 ]]; then
+        print_error "无效的端口号"
+        return
+    fi
+
+    read -r -p "请输入内网目标服务地址 (如 127.0.0.1:22): " target
+    if [[ -z "$target" ]]; then
+        print_error "目标地址不能为空"
+        return
+    fi
+
+    echo ""
+    echo -e "请选择跳板机协议:"
+    echo -e "  [1] SOCKS5"
+    echo -e "  [2] Relay (GOST v3 原生)"
+    echo ""
+    read -r -p "请选择 [1-2] (默认: 1): " jp_choice
+    jp_choice=${jp_choice:-1}
+
+    local jump_proto
+    case "$jp_choice" in
+        1) jump_proto="socks5" ;;
+        2) jump_proto="relay" ;;
+        *) jump_proto="socks5" ;;
+    esac
+
+    read -r -p "请输入跳板机地址 (格式: IP:端口): " jump_addr
+    if [[ -z "$jump_addr" ]]; then
+        print_error "跳板机地址不能为空"
+        return
+    fi
+
+    # rtcp/LOCAL_PORT#TARGET#JUMP_URL
+    echo "rtcp/${local_port}#${target}#${jump_proto}://${jump_addr}" >> "$GOST_RAW_CONFIG"
+
+    generate_config
+    restart_gost
+
+    echo ""
+    print_success "反向代理隧道配置已添加"
+    echo -e "  跳板机 :${local_port}  →  本机 ${target}"
+    echo -e "  通过 ${jump_proto}://${jump_addr} 建立隧道"
+    echo ""
+    print_warn "注意: 跳板机需要额外运行 GOST 服务端 (handler: tcp/relay，listener: ${jump_proto})"
+}
+
 show_config() {
     print_header
     print_line
@@ -909,14 +1180,20 @@ show_config() {
             encrypt_tls) type_display="TLS加密隧道" ;;
             encrypt_ws) type_display="WS加密隧道" ;;
             encrypt_wss) type_display="WSS加密隧道" ;;
+            encrypt_grpc) type_display="gRPC加密隧道" ;;
+            encrypt_quic) type_display="QUIC加密隧道" ;;
             decrypt_tls) type_display="TLS解密" ;;
             decrypt_ws) type_display="WS解密" ;;
             decrypt_wss) type_display="WSS解密" ;;
+            decrypt_grpc) type_display="gRPC解密" ;;
+            decrypt_quic) type_display="QUIC解密" ;;
             proxy_http) type_display="HTTP代理" ;;
             proxy_socks5) type_display="SOCKS5代理" ;;
             proxy_auto) type_display="HTTP/SOCKS5" ;;
             ss) type_display="Shadowsocks" ;;
             lb_*) type_display="负载均衡" ;;
+            sni) type_display="SNI代理" ;;
+            rtcp) type_display="反向隧道" ;;
             *) type_display="$config_type" ;;
         esac
         
@@ -931,6 +1208,10 @@ show_config() {
             fi
         elif [[ "$config_type" == lb_* ]]; then
             target_display="${target}"
+        elif [[ "$config_type" == "sni" ]]; then
+            target_display="SNI 透明转发"
+        elif [[ "$config_type" == "rtcp" ]]; then
+            target_display="${target} via ${extra}"
         else
             target_display="${target}:${extra%%\?*}"
         fi
@@ -975,6 +1256,14 @@ delete_config() {
 # ==================== 配置生成 ====================
 
 generate_config() {
+    if [[ "$GOST_MAJOR" == "3" ]]; then
+        generate_config_v3
+    else
+        generate_config_v2
+    fi
+}
+
+generate_config_v2() {
     # 如果原始配置文件不存在或为空，生成空配置
     if [[ ! -f "$GOST_RAW_CONFIG" ]] || [[ ! -s "$GOST_RAW_CONFIG" ]]; then
         cat > "$GOST_CONFIG_FILE" << 'EOF'
@@ -1159,6 +1448,329 @@ EOF
     
     # 清理临时文件
     rm -f "$tmp_serve" "$tmp_routes"
+}
+
+# -------------------- v3 YAML 配置生成 --------------------
+
+generate_config_v3() {
+    local tmp_services="/tmp/gost_services_$$"
+    local tmp_chains="/tmp/gost_chains_$$"
+    : > "$tmp_services"
+    : > "$tmp_chains"
+
+    local idx=0
+    local has_chain_for_cert=0
+
+    # 证书文件路径（v3 需要写到 listener.tls 里）
+    local cert_file="${GOST_CERT_DIR}/cert.pem"
+    local key_file="${GOST_CERT_DIR}/key.pem"
+    local has_cert=0
+    if [[ -f "$cert_file" && -f "$key_file" ]]; then
+        has_cert=1
+    fi
+
+    if [[ -f "$GOST_RAW_CONFIG" && -s "$GOST_RAW_CONFIG" ]]; then
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+
+            local config_type="${line%%/*}"
+            local rest="${line#*/}"
+            local local_port="${rest%%#*}"
+            rest="${rest#*#}"
+            local param1="${rest%%#*}"
+            local param2="${rest#*#}"
+
+            local svc_name="svc-${idx}"
+            local chain_name="chain-${idx}"
+
+            case "$config_type" in
+                forward)
+                    # TCP + UDP 端口转发
+                    cat >> "$tmp_services" << EOF
+- name: ${svc_name}-tcp
+  addr: ":${local_port}"
+  handler:
+    type: tcp
+  listener:
+    type: tcp
+  forwarder:
+    nodes:
+    - name: target-0
+      addr: ${param1}:${param2}
+- name: ${svc_name}-udp
+  addr: ":${local_port}"
+  handler:
+    type: udp
+  listener:
+    type: udp
+  forwarder:
+    nodes:
+    - name: target-0
+      addr: ${param1}:${param2}
+EOF
+                    ;;
+
+                encrypt_tls|encrypt_ws|encrypt_wss|encrypt_grpc|encrypt_quic)
+                    # 中转机：relay handler + 对应 dialer 的转发链
+                    local transport="${config_type#encrypt_}"
+                    local dialer_type="$transport"
+                    local secure_line=""
+                    if [[ "$param2" == *"secure=true"* ]]; then
+                        secure_line="          secure: true"
+                        param2="${param2%%\?*}"
+                    fi
+
+                    # 监听器类型: quic 用 udp，其它 tcp
+                    local listener_type="tcp"
+                    [[ "$transport" == "quic" ]] && listener_type="udp"
+
+                    cat >> "$tmp_services" << EOF
+- name: ${svc_name}
+  addr: ":${local_port}"
+  handler:
+    type: relay
+    chain: ${chain_name}
+  listener:
+    type: ${listener_type}
+EOF
+
+                    {
+                        echo "- name: ${chain_name}"
+                        echo "  hops:"
+                        echo "  - name: hop-0"
+                        echo "    nodes:"
+                        echo "    - name: node-0"
+                        echo "      addr: ${param1}:${param2}"
+                        echo "      connector:"
+                        echo "        type: relay"
+                        echo "      dialer:"
+                        echo "        type: ${dialer_type}"
+                        if [[ -n "$secure_line" ]]; then
+                            echo "        tls:"
+                            echo "$secure_line"
+                        fi
+                    } >> "$tmp_chains"
+                    ;;
+
+                decrypt_tls|decrypt_ws|decrypt_wss|decrypt_grpc|decrypt_quic)
+                    # 落地机：relay handler + 对应 listener + forwarder
+                    local transport="${config_type#decrypt_}"
+                    local listener_type="$transport"
+                    local tls_block=""
+
+                    if [[ "$has_cert" == "1" && ( "$transport" == "tls" || "$transport" == "wss" || "$transport" == "grpc" || "$transport" == "quic" ) ]]; then
+                        tls_block=$(cat << EOF
+    tls:
+      certFile: ${cert_file}
+      keyFile: ${key_file}
+EOF
+)
+                    fi
+
+                    cat >> "$tmp_services" << EOF
+- name: ${svc_name}
+  addr: ":${local_port}"
+  handler:
+    type: relay
+  listener:
+    type: ${listener_type}
+EOF
+                    if [[ -n "$tls_block" ]]; then
+                        echo "$tls_block" >> "$tmp_services"
+                    fi
+                    cat >> "$tmp_services" << EOF
+  forwarder:
+    nodes:
+    - name: target-0
+      addr: ${param1}:${param2}
+EOF
+                    ;;
+
+                proxy_http|proxy_socks5|proxy_auto)
+                    local handler_type
+                    case "$config_type" in
+                        proxy_http) handler_type="http" ;;
+                        proxy_socks5) handler_type="socks5" ;;
+                        proxy_auto) handler_type="auto" ;;
+                    esac
+
+                    local auth_block=""
+                    if [[ -n "$param1" && "$param1" == *:* ]]; then
+                        local u="${param1%%:*}"
+                        local p="${param1#*:}"
+                        p="${p%@}"
+                        auth_block=$(cat << EOF
+    auth:
+      username: ${u}
+      password: ${p}
+EOF
+)
+                    fi
+
+                    cat >> "$tmp_services" << EOF
+- name: ${svc_name}
+  addr: ":${local_port}"
+  handler:
+    type: ${handler_type}
+EOF
+                    if [[ -n "$auth_block" ]]; then
+                        echo "$auth_block" >> "$tmp_services"
+                    fi
+                    cat >> "$tmp_services" << EOF
+  listener:
+    type: tcp
+EOF
+                    ;;
+
+                ss)
+                    # Shadowsocks: handler=ss, metadata.method=加密算法, auth.password=密码
+                    cat >> "$tmp_services" << EOF
+- name: ${svc_name}
+  addr: ":${local_port}"
+  handler:
+    type: ss
+    auth:
+      password: ${param2}
+    metadata:
+      method: ${param1}
+  listener:
+    type: tcp
+- name: ${svc_name}-udp
+  addr: ":${local_port}"
+  handler:
+    type: ssu
+    auth:
+      password: ${param2}
+    metadata:
+      method: ${param1}
+  listener:
+    type: udp
+EOF
+                    ;;
+
+                lb_*)
+                    # 负载均衡: forwarder.nodes 列表 + selector
+                    local strategy="${config_type#lb_}"
+                    local servers="$param1"
+                    local node_yaml=""
+                    local n=0
+                    IFS=',' read -ra arr <<< "$servers"
+                    for s in "${arr[@]}"; do
+                        node_yaml+="    - name: target-${n}
+      addr: ${s}
+"
+                        n=$((n + 1))
+                    done
+
+                    cat >> "$tmp_services" << EOF
+- name: ${svc_name}-tcp
+  addr: ":${local_port}"
+  handler:
+    type: tcp
+  listener:
+    type: tcp
+  forwarder:
+    nodes:
+${node_yaml%$'\n'}
+    selector:
+      strategy: ${strategy}
+      maxFails: 1
+      failTimeout: 30s
+- name: ${svc_name}-udp
+  addr: ":${local_port}"
+  handler:
+    type: udp
+  listener:
+    type: udp
+  forwarder:
+    nodes:
+${node_yaml%$'\n'}
+    selector:
+      strategy: ${strategy}
+      maxFails: 1
+      failTimeout: 30s
+EOF
+                    ;;
+
+                sni)
+                    # SNI 代理 (v3 独有)：handler=sni
+                    # param1=无（留空），param2=未使用
+                    cat >> "$tmp_services" << EOF
+- name: ${svc_name}
+  addr: ":${local_port}"
+  handler:
+    type: sni
+  listener:
+    type: tcp
+EOF
+                    ;;
+
+                rtcp)
+                    # 反向 TCP 隧道 (v3 独有)
+                    # param1=目标本地服务(如 127.0.0.1:22)  param2=跳板节点(如 socks5://1.2.3.4:1080)
+                    local jump_addr="${param2#*://}"
+                    local jump_proto="${param2%%://*}"
+                    cat >> "$tmp_services" << EOF
+- name: ${svc_name}
+  addr: ":${local_port}"
+  handler:
+    type: rtcp
+  listener:
+    type: rtcp
+    chain: ${chain_name}
+  forwarder:
+    nodes:
+    - name: target-0
+      addr: ${param1}
+EOF
+                    {
+                        echo "- name: ${chain_name}"
+                        echo "  hops:"
+                        echo "  - name: hop-0"
+                        echo "    nodes:"
+                        echo "    - name: node-0"
+                        echo "      addr: ${jump_addr}"
+                        echo "      connector:"
+                        echo "        type: ${jump_proto}"
+                        echo "      dialer:"
+                        echo "        type: tcp"
+                    } >> "$tmp_chains"
+                    ;;
+            esac
+
+            idx=$((idx + 1))
+        done < "$GOST_RAW_CONFIG"
+    fi
+
+    # 组装最终 YAML
+    {
+        echo "# GOST v3 configuration (auto-generated by gost.sh)"
+        echo "# Do not edit by hand. Use the script menu to manage rules."
+        echo ""
+
+        if [[ -s "$tmp_services" ]]; then
+            echo "services:"
+            cat "$tmp_services"
+        else
+            echo "services: []"
+        fi
+
+        echo ""
+
+        if [[ -s "$tmp_chains" ]]; then
+            echo "chains:"
+            cat "$tmp_chains"
+        else
+            echo "chains: []"
+        fi
+
+        echo ""
+        echo "log:"
+        echo "  level: info"
+        echo "  format: text"
+    } > "$GOST_CONFIG_FILE"
+
+    rm -f "$tmp_services" "$tmp_chains"
 }
 
 # ==================== 高级功能 ====================
@@ -1391,7 +2003,7 @@ manage_cron() {
 update_gost() {
     print_header
     print_line
-    echo -e "${BOLD}更新 GOST${NC}"
+    echo -e "${BOLD}更新 GOST (v${GOST_MAJOR})${NC}"
     print_line
     
     local installed_ver
@@ -1459,8 +2071,14 @@ show_menu() {
     local installed_ver
     installed_ver=$(get_installed_version)
     
+    echo -e "  当前模式: ${CYAN}GOST v${GOST_MAJOR}${NC}"
     if [[ -n "$installed_ver" ]]; then
-        echo -e "  当前版本: ${GREEN}v${installed_ver}${NC}"
+        local installed_major
+        installed_major=$(detect_installed_major)
+        echo -e "  已安装版本: ${GREEN}v${installed_ver}${NC} (主版本 v${installed_major:-?})"
+        if [[ -n "$installed_major" && "$installed_major" != "$GOST_MAJOR" ]]; then
+            echo -e "  ${YELLOW}⚠ 菜单模式与已安装版本不一致${NC}"
+        fi
         if systemctl is-active --quiet gost 2>/dev/null; then
             echo -e "  运行状态: ${GREEN}运行中${NC}"
         else
@@ -1489,10 +2107,65 @@ show_menu() {
     echo -e "  ${BOLD}高级功能${NC}"
     echo -e "    ${GREEN}[12]${NC} TLS 证书管理"
     echo -e "    ${GREEN}[13]${NC} 定时重启设置"
+    echo -e "    ${GREEN}[14]${NC} 切换 v2/v3 菜单模式"
     echo ""
     echo -e "    ${GREEN}[0]${NC}  退出"
     echo ""
     print_line
+}
+
+# ==================== 版本选择界面 ====================
+
+show_version_selector() {
+    print_header
+    echo -e "  ${BOLD}请选择 GOST 版本${NC}"
+    print_line
+    echo ""
+    echo -e "  ${GREEN}[1]${NC} ${BOLD}GOST v2${NC}  (ginuerzh/gost)"
+    echo -e "      ${CYAN}• 协议: TCP/UDP/TLS/WS/WSS/HTTP/SOCKS5/SS${NC}"
+    echo -e "      ${CYAN}• 配置: JSON (ServeNodes/Routes/ChainNodes)${NC}"
+    echo -e "      ${CYAN}• 特点: 成熟稳定，社区教程多${NC}"
+    echo -e "      ${YELLOW}• 状态: 原作者已基本停止维护${NC}"
+    echo ""
+    echo -e "  ${GREEN}[2]${NC} ${BOLD}GOST v3${NC}  (go-gost/gost) ${GREEN}[推荐]${NC}"
+    echo -e "      ${CYAN}• 协议: v2 全部 + gRPC/QUIC/HTTP2/HTTP3/KCP/SSH/SNI${NC}"
+    echo -e "      ${CYAN}         + 反向代理隧道/TUN/TAP/透明代理${NC}"
+    echo -e "      ${CYAN}• 配置: YAML (services/chains，结构化、模块化)${NC}"
+    echo -e "      ${CYAN}• 特点: 支持 Web API 动态配置、热加载、限速、监控指标${NC}"
+    echo -e "      ${GREEN}• 状态: 活跃维护 (当前稳定版 v${GOST_V3_DEFAULT_VERSION})${NC}"
+    echo ""
+    print_line
+    echo -e "  ${YELLOW}提示${NC}: v2 与 v3 配置文件格式不兼容，二进制与配置同路径互斥。"
+    echo -e "        同一时间只能运行一个版本；切换版本建议先卸载或备份配置。"
+    echo ""
+
+    # 如果已安装，显示默认提示
+    local installed_major
+    installed_major=$(detect_installed_major)
+    local default_choice="2"
+    if [[ -n "$installed_major" ]]; then
+        default_choice="$installed_major"
+        echo -e "  ${CYAN}检测到已安装 GOST v${installed_major}，默认选择 [${default_choice}]${NC}"
+        echo ""
+    fi
+
+    read -r -p "请选择 [1-2] (默认: ${default_choice}): " v_choice
+    v_choice=${v_choice:-$default_choice}
+
+    case "$v_choice" in
+        1) GOST_MAJOR="2" ;;
+        2) GOST_MAJOR="3" ;;
+        *)
+            print_error "无效选择"
+            sleep 1
+            show_version_selector
+            return
+            ;;
+    esac
+
+    load_version_context
+    print_success "已进入 GOST v${GOST_MAJOR} 菜单模式"
+    sleep 1
 }
 
 main() {
@@ -1509,10 +2182,13 @@ main() {
         OS="ubuntu"
         PM="apt-get"
     fi
-    
+
+    # 启动时必须先选择版本
+    show_version_selector
+
     while true; do
         show_menu
-        read -r -p "请选择 [0-13]: " choice
+        read -r -p "请选择 [0-14]: " choice
         
         case $choice in
             1) install_gost ;;
@@ -1528,6 +2204,7 @@ main() {
             11) delete_config ;;
             12) manage_cert ;;
             13) manage_cron ;;
+            14) show_version_selector ;;
             0)
                 echo ""
                 print_info "感谢使用，再见!"
